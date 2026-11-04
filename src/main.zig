@@ -14,6 +14,12 @@ const LegacyConfig = extern struct { magic: [8]u8, id: core.Id, count: u32, peer
 const Nearby = struct { id: core.Id, ip: [16]u8, name: [64]u8, seen: u64 };
 var config: Config = .{};
 var peer_compatible: [16]bool = @splat(false);
+// Keys survive app upgrades, so an authenticated frame from another version may be a
+// recording replayed from before the upgrade. Such a frame only makes the peer suspect:
+// it is probed, and demoted only if no fresh, counter-checked frame arrives in time.
+const suspect_timeout = 15000;
+var suspect_until: [16]u64 = @splat(0);
+var suspect_counter: [16]u64 = @splat(0);
 var nearby: [16]?Nearby = @splat(null);
 var history = core.History{ .allocator = allocator };
 var last_hash: ?[32]u8 = null;
@@ -388,10 +394,13 @@ export fn cs_action(action: c_int, index: c_int) void {
             while (j + 1 < config.count) : (j += 1) {
                 config.peers[j] = config.peers[j + 1];
                 peer_compatible[j] = peer_compatible[j + 1];
+                suspect_until[j] = suspect_until[j + 1];
+                suspect_counter[j] = suspect_counter[j + 1];
             }
             config.count -= 1;
             config.peers[config.count] = .{};
             peer_compatible[config.count] = false;
+            suspect_until[config.count] = 0;
             save();
             refresh();
         },
@@ -547,6 +556,7 @@ fn addPeer(id: core.Id, key: core.Key, ip: [16]u8, name: []const u8) ?usize {
     if (i == config.count) config.count += 1;
     config.peers[i] = .{ .id = id, .key = key, .ip = ip };
     peer_compatible[i] = true;
+    suspect_until[i] = 0;
     c.cs_peer_authorized(@ptrCast(&ip));
     set(&config.peers[i].name, name);
     save();
@@ -574,13 +584,15 @@ fn receive() void {
     const nonce: [12]u8 = packet[24..36].*;
     const item = core.decode(packet, key) catch |err| {
         c.cs_log_event("receive_rejected", null, &nonce, @ptrCast(&ip), 0, packet.len, c.cs_millis() - received_at);
-        if (err == error.IncompatibleVersion) hideIncompatible(id);
+        if (err == error.IncompatibleVersion) suspectIncompatible(i);
         return;
     };
     if (!acceptCounter(&config.peers[i], item.counter)) {
         c.cs_log_event("receive_replayed", null, &nonce, @ptrCast(&ip), 0, packet.len, c.cs_millis() - received_at);
         return;
     }
+    // A counter newer than any seen before the mismatch proves the peer runs this version now.
+    if (suspect_until[i] != 0 and item.counter > suspect_counter[i]) suspect_until[i] = 0;
     c.cs_peer_authorized(@ptrCast(&ip));
     if (!peer_compatible[i]) {
         peer_compatible[i] = true;
@@ -643,11 +655,29 @@ fn hideNearby(id: core.Id) void {
     }
     refresh();
 }
-// Only for authenticated evidence: the peer itself sent a frame with another app version.
+fn suspectIncompatible(i: usize) void {
+    // Repeated mismatches never extend the deadline, so a peer that really changed
+    // version is still demoted on time.
+    if (!peer_compatible[i] or suspect_until[i] != 0) return;
+    suspect_until[i] = c.cs_millis() + suspect_timeout;
+    suspect_counter[i] = config.peers[i].recv_counter;
+    _ = sendItem(.{ .kind = 1, .name = "@probe", .data = slice(&host) }, config.peers[i]);
+}
+fn expireSuspects(now: u64) void {
+    for (0..config.count) |i| {
+        if (suspect_until[i] != 0 and now > suspect_until[i]) {
+            suspect_until[i] = 0;
+            c.cs_log_event("peer_version_mismatch", null, null, @ptrCast(&config.peers[i].ip), 0, 0, 0);
+            hideIncompatible(config.peers[i].id);
+        }
+    }
+}
+// Only after a mismatch the peer could not refute with a fresh frame (see suspectIncompatible).
 fn hideIncompatible(id: core.Id) void {
     hideNearby(id);
     if (peerIndex(id)) |i| {
         peer_compatible[i] = false;
+        suspect_until[i] = 0;
         c.cs_peer_forget(@ptrCast(&config.peers[i].ip));
     }
     refresh();
@@ -772,6 +802,7 @@ export fn cs_tick() void {
     }
     for (0..8) |_| receive();
     retryWrite(now);
+    expireSuspects(now);
     if (pending) |p| {
         if (c.cs_pair_status() == 0) {
             pending = null;
@@ -802,6 +833,8 @@ fn resetTest() void {
     config = .{ .id = @splat(1) };
     nearby = @splat(null);
     peer_compatible = @splat(false);
+    suspect_until = @splat(0);
+    suspect_counter = @splat(0);
     last_hash = null;
     paused = false;
     pairing_code = null;
@@ -1116,8 +1149,23 @@ test "saved peers need authenticated matching versions before appearing or synci
     var other = version.wire;
     other[0] = '9';
     const bad = try core.encode(&send_buffer, id, @splat(2), key, .{ .kind = 1, .name = "", .data = "Wrong version", .app_version = other });
-    cs_test_queue(bad.ptr, bad.len, "192.168.1.20");
+    var mismatch: [256]u8 = undefined;
+    const mismatch_len = bad.len;
+    @memcpy(mismatch[0..mismatch_len], bad);
+    const probes = cs_test_sends();
+    cs_test_queue(&mismatch, mismatch_len, "192.168.1.20");
     receive();
+    // The mismatch could be a recording, so the peer is probed before it is demoted.
+    try std.testing.expect(peer_compatible[0]);
+    try std.testing.expectEqual(probes + 1, cs_test_sends());
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_writes());
+    // Further mismatches neither send more probes nor extend the deadline.
+    cs_test_time(1000 + 10000);
+    cs_test_queue(&mismatch, mismatch_len, "192.168.1.20");
+    receive();
+    try std.testing.expectEqual(probes + 1, cs_test_sends());
+    cs_test_time(1000 + suspect_timeout + 1);
+    cs_tick();
     try std.testing.expect(!peer_compatible[0]);
     try std.testing.expectEqual(@as(c_int, 0), cs_test_writes());
     try std.testing.expectEqualStrings("Saved Windows (192.168.1.20) · offline — Forget", std.mem.span(cs_peer_label(0)));
@@ -1447,4 +1495,31 @@ test "files named like control messages sync as ordinary files" {
     cs_action(1, 0);
     const last = cs_test_log_count() - 1;
     try std.testing.expectEqualStrings("send_queued", std.mem.span(cs_test_log_stage(last)));
+}
+test "a replayed old-version frame cannot demote a peer that answers its probe" {
+    resetTest();
+    defer history.deinit();
+    const id: core.Id = @splat(2);
+    const key: core.Key = @splat(9);
+    _ = addPeer(id, key, @splat(0), "Windows");
+    try queueTest(id, key, 5, .{ .kind = 1, .name = "", .data = "current", .event = @splat(1) });
+    receive();
+    var older = version.wire;
+    @memcpy(older[0..5], "0.2.6");
+    // Recorded before both devices upgraded; the key is unchanged.
+    const recorded = try core.encode(&send_buffer, id, @splat(1), key, .{ .kind = 1, .name = "", .data = "old", .app_version = older });
+    cs_test_queue(recorded.ptr, recorded.len, "10.0.0.66");
+    receive();
+    try std.testing.expect(suspect_until[0] != 0);
+    // A frame the window already accepted cannot clear the suspicion; a fresh reply does.
+    try queueTest(id, key, 5, .{ .kind = 1, .name = "@pair", .data = "Windows" });
+    receive();
+    try std.testing.expect(suspect_until[0] != 0);
+    try queueTest(id, key, 6, .{ .kind = 1, .name = "@pair", .data = "Windows" });
+    receive();
+    try std.testing.expect(suspect_until[0] == 0);
+    cs_test_time(1000 + suspect_timeout + 1);
+    cs_tick();
+    try std.testing.expect(peer_compatible[0]);
+    try std.testing.expectEqual(@as(u32, 1), config.count);
 }

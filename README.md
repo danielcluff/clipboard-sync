@@ -118,8 +118,11 @@ After updating both computers to the same version, their saved keys work again.
 Discovery packets advertise a device name and random device ID without encryption.
 Device names in the nearby list are untrusted; verify the target before pairing.
 Because discovery and pairing hellos are unauthenticated, a version mismatch they
-report only hides the nearby entry; only an authenticated frame from a saved device
-can mark that device incompatible.
+report only hides the nearby entry. Because saved keys survive upgrades, an
+authenticated frame from another version may be an old recording, so it only
+triggers a probe: the device is marked incompatible (logging
+`peer_version_mismatch`) only if no fresh, counter-checked frame arrives within
+15 seconds. Further mismatches do not extend that deadline.
 
 Devices communicate on **TCP and UDP port 45832**, over IPv4 on the local network.
 Wi-Fi client isolation, guest networks, VPNs, and firewalls may block communication.
