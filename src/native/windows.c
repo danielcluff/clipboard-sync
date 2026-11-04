@@ -150,7 +150,7 @@ static void rebuild_menu(void) {
         if (*s)
             add(devices, s, 3, i);
     }
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)devices, L"Devices");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)devices, L"Connect");
     add(menu, cs_sync_action_label(), 5, 0);
     add(menu, "Quit Clipboard Sync", 7, 0);
 }

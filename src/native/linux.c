@@ -94,7 +94,7 @@ void cs_refresh(void) {
     if (!count)
         add(menu, "Copy text or a small file to begin", 0, 0);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-    GtkWidget *devices = gtk_menu_item_new_with_label("Devices");
+    GtkWidget *devices = gtk_menu_item_new_with_label("Connect");
     GtkWidget *sub = gtk_menu_new();
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(devices), sub);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), devices);

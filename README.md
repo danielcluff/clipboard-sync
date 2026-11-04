@@ -39,7 +39,7 @@ On macOS, launch `zig-out/Clipboard Sync.app`. On Windows, launch
 `zig-out/bin/clipboard-sync.exe`; Linux uses `zig-out/bin/clipboard-sync`.
 Run it on each computer. macOS shows **⇄** in the menu bar; Windows shows a system
 tray icon. Open the top **Sync active / paired count** submenu to see paired devices
-and forget a device. **Devices** contains nearby discovery and pairing actions only.
+and forget a device. **Connect** contains nearby discovery and pairing actions only.
 Quit and pause/resume are available in the main menu.
 
 ### macOS
@@ -90,10 +90,10 @@ Zig cannot supply third-party desktop libraries automatically.
 
 ## Pair two computers
 
-1. On computer B, open **Devices → Allow a new device…**. A six-digit
+1. On computer B, open **Connect → Allow a new device…**. A six-digit
    code appears in a live window. Leave it open while you pair; the app keeps
    processing connections. The code expires two minutes after it is generated.
-2. On computer A, open **Devices** and select B from nearby devices. Enter B's code, including any leading zeros.
+2. On computer A, open **Connect** and select B from nearby devices. Enter B's code, including any leading zeros.
    If discovery is blocked, choose **Connect by IP address…** instead.
 3. Both menus show the paired device after the authenticated reply arrives.
 4. Copy normally on either computer, then paste on the other.

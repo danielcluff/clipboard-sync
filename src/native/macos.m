@@ -112,10 +112,10 @@ static void populateMenu(NSMenu *menu) {
     if (!count)
         add(menu, "Copy text or a small file to begin", 0, 0);
     [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *devices = [[NSMenuItem alloc] initWithTitle:@"Devices"
+    NSMenuItem *devices = [[NSMenuItem alloc] initWithTitle:@"Connect"
                                                      action:nil
                                               keyEquivalent:@""];
-    NSMenu *sub = [[NSMenu alloc] initWithTitle:@"Devices"];
+    NSMenu *sub = [[NSMenu alloc] initWithTitle:@"Connect"];
     add(sub, "Allow a new device…", 2, 0);
     add(sub, "Connect by IP address…", 4, 0);
     [sub addItem:[NSMenuItem separatorItem]];
