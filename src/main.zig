@@ -4,8 +4,13 @@ const version = @import("version.zig");
 const pairing = @import("pairing.zig");
 const c = @import("bridge.zig");
 const allocator = std.heap.page_allocator;
-const Peer = extern struct { id: core.Id = @splat(0), key: core.Key = @splat(0), ip: [16]u8 = @splat(0), name: [64]u8 = @splat(0) };
-const Config = extern struct { magic: [8]u8 = "CLIPCF01".*, id: core.Id = @splat(0), count: u32 = 0, peers: [16]Peer = @splat(Peer{}) };
+// recv_counter is the highest authenticated counter accepted from this peer; bit k of
+// recv_window records counter (recv_counter - k). Both persist so restarts keep rejecting replays.
+const Peer = extern struct { id: core.Id = @splat(0), key: core.Key = @splat(0), ip: [16]u8 = @splat(0), name: [64]u8 = @splat(0), recv_counter: u64 = 0, recv_window: u64 = 0 };
+// send_reserved is persisted ahead of use so outgoing counters never repeat after a restart.
+const Config = extern struct { magic: [8]u8 = "CLIPCF02".*, id: core.Id = @splat(0), count: u32 = 0, send_reserved: u64 = 0, peers: [16]Peer = @splat(Peer{}) };
+const LegacyPeer = extern struct { id: core.Id, key: core.Key, ip: [16]u8, name: [64]u8 };
+const LegacyConfig = extern struct { magic: [8]u8, id: core.Id, count: u32, peers: [16]LegacyPeer };
 const Nearby = struct { id: core.Id, ip: [16]u8, name: [64]u8, seen: u64 };
 var config: Config = .{};
 var peer_compatible: [16]bool = @splat(false);
@@ -24,9 +29,8 @@ var nearby_labels: [16][160:0]u8 = @splat(@splat(0));
 var status: [160:0]u8 = @splat(0);
 var receive_buffer: [core.max_packet]u8 = undefined;
 var send_buffer: [core.max_packet]u8 = undefined;
-// Nonces are remembered per peer to reject recently replayed authenticated frames.
-var nonces: [16][64][12]u8 = @splat(@splat(@splat(0)));
-var nonce_next: [16]usize = @splat(0);
+var send_next: u64 = 1;
+const counter_reservation = 1024;
 fn slice(buf: []const u8) []const u8 {
     return buf[0 .. std.mem.indexOfScalar(u8, buf, 0) orelse buf.len];
 }
@@ -37,8 +41,62 @@ fn set(dest: []u8, value: []const u8) void {
 fn random(bytes: []u8) bool {
     return c.cs_random(bytes.ptr, bytes.len) == 1;
 }
+// Replay state is saved for every accepted frame, so report a failure once, not per frame.
+var save_failure_reported = false;
 fn save() void {
-    if (c.cs_save(&config, @sizeOf(Config)) != 1) c.cs_notice("Could not save devices", "Check permissions on the Clipboard Sync data directory.");
+    if (c.cs_save(&config, @sizeOf(Config)) == 1) {
+        save_failure_reported = false;
+    } else if (!save_failure_reported) {
+        save_failure_reported = true;
+        c.cs_notice("Could not save devices", "Check permissions on the Clipboard Sync data directory.");
+    }
+}
+fn loadConfig(bytes: []const u8) ?Config {
+    var result: Config = .{};
+    if (bytes.len == @sizeOf(Config) and std.mem.eql(u8, bytes[0..8], "CLIPCF02")) {
+        result = std.mem.bytesToValue(Config, bytes[0..@sizeOf(Config)]);
+    } else if (bytes.len == @sizeOf(LegacyConfig) and std.mem.eql(u8, bytes[0..8], "CLIPCF01")) {
+        // Older files kept no replay state; peers start with an empty window.
+        const legacy = std.mem.bytesToValue(LegacyConfig, bytes[0..@sizeOf(LegacyConfig)]);
+        result.id = legacy.id;
+        result.count = legacy.count;
+        for (legacy.peers, &result.peers) |old, *peer| peer.* = .{ .id = old.id, .key = old.key, .ip = old.ip, .name = old.name };
+    } else return null;
+    if (result.count > 16) return null;
+    for (&result.peers) |*peer| {
+        peer.ip[15] = 0;
+        peer.name[63] = 0;
+    }
+    return result;
+}
+fn nextCounter() u64 {
+    if (send_next >= config.send_reserved) {
+        config.send_reserved = send_next + counter_reservation;
+        save();
+    }
+    defer send_next += 1;
+    return send_next;
+}
+// Sliding-window replay check (as in IPsec): accept each counter once, tolerating
+// reordering of up to 64 frames across reconnects and alternate channels.
+fn acceptCounter(peer: *Peer, counter: u64) bool {
+    if (counter == 0) return false;
+    if (counter > peer.recv_counter) {
+        const shift = counter - peer.recv_counter;
+        peer.recv_window = if (shift >= 64) 1 else (peer.recv_window << @intCast(shift)) | 1;
+        peer.recv_counter = counter;
+        return true;
+    }
+    const offset = peer.recv_counter - counter;
+    if (offset >= 64) return false;
+    const bit = @as(u64, 1) << @intCast(offset);
+    if (peer.recv_window & bit != 0) return false;
+    peer.recv_window |= bit;
+    return true;
+}
+// Control messages are text items with reserved names, so files may use any valid name.
+fn isControl(item: core.Item, name: []const u8) bool {
+    return item.kind == 1 and std.mem.eql(u8, item.name, name);
 }
 fn peerIndex(id: core.Id) ?usize {
     for (config.peers[0..config.count], 0..) |peer, i| if (std.mem.eql(u8, &peer.id, &id)) return i;
@@ -82,8 +140,10 @@ export fn cs_poll_clipboard() void {
         const item = core.Item{ .kind = @intCast(clip.kind), .name = slice(&clip.name), .data = clip.data[0..clip.len] };
         const hash = core.fingerprint(item);
         if (last_hash == null or !std.mem.eql(u8, &last_hash.?, &hash)) {
+            // A newer local copy supersedes any remote update still waiting to be written.
+            cancelWriteRetry();
             remember(item);
-            propagate(item, null);
+            propagateLocal(item);
         }
     }
 }
@@ -102,10 +162,12 @@ fn refresh() void {
             _ = std.mem.printSentinel(label, "{d}. {s}{s}", .{ i + 1, if (entry.kind == 2) "File: " else "", text }, 0) catch unreachable;
         }
     }
+    // Every saved device stays listed so it can be revoked while offline or unverified.
     for (&peer_labels, 0..) |*label, i| {
         @memset(label, 0);
-        if (i < config.count and peer_compatible[i]) {
-            _ = std.mem.printSentinel(label, "{s} ({s}) — Forget", .{ slice(&config.peers[i].name), slice(&config.peers[i].ip) }, 0) catch unreachable;
+        if (i < config.count) {
+            const state = if (peer_compatible[i]) "" else " · offline";
+            _ = std.mem.printSentinel(label, "{s} ({s}){s} — Forget", .{ slice(&config.peers[i].name), slice(&config.peers[i].ip), state }, 0) catch unreachable;
         }
     }
     for (&nearby_labels, 0..) |*label, i| {
@@ -152,8 +214,10 @@ export fn cs_status() [*:0]const u8 {
 fn sendItem(item: core.Item, peer: Peer) bool {
     var nonce: [12]u8 = undefined;
     if (!random(&nonce)) return false;
-    const packet = core.encode(&send_buffer, config.id, nonce, peer.key, item) catch return false;
-    if (std.mem.eql(u8, item.name, "@probe") or std.mem.eql(u8, item.name, "@pair"))
+    var framed = item;
+    framed.counter = nextCounter();
+    const packet = core.encode(&send_buffer, config.id, nonce, peer.key, framed) catch return false;
+    if (isControl(item, "@probe") or isControl(item, "@pair"))
         return c.cs_send_control(@ptrCast(&peer.ip), packet.ptr, packet.len) == 1;
     const accepted = c.cs_send(@ptrCast(&peer.ip), packet.ptr, packet.len) == 1;
     c.cs_log_event(if (accepted) "send_queued" else "send_failed", &item.event, &nonce, @ptrCast(&peer.ip), item.kind, item.data.len, 0);
@@ -169,13 +233,15 @@ fn recordEvent(id: core.Id) void {
     recent_events[recent_next % recent_events.len] = id;
     recent_next +%= 1;
 }
-fn propagate(original: core.Item, except: ?usize) void {
+fn propagateLocal(original: core.Item) void {
     var item = original;
-    if (except == null) {
-        if (!random(&item.event)) return;
-        recordEvent(item.event);
-        c.cs_log_event("copy_detected", &item.event, null, "local", item.kind, item.data.len, 0);
-    }
+    if (!random(&item.event)) return;
+    recordEvent(item.event);
+    c.cs_log_event("copy_detected", &item.event, null, "local", item.kind, item.data.len, 0);
+    forward(item, null);
+}
+// Relays an item with its existing event ID to every verified peer except its origin.
+fn forward(item: core.Item, except: ?usize) void {
     for (config.peers[0..config.count], 0..) |peer, i| {
         if (except != null and except.? == i) continue;
         if (!peer_compatible[i]) continue;
@@ -192,6 +258,54 @@ fn remember(item: core.Item) void {
     last_hash = core.fingerprint(item);
     refresh();
 }
+// A remote update whose clipboard write failed (for example, another app briefly holds
+// the Windows clipboard). Only the newest is kept; later copies supersede it.
+const WriteRetry = struct { from: core.Id, ip: [16]u8, kind: u8, event: core.Id, name: []u8, data: []u8, received_at: u64, attempts: u8, next: u64 };
+var write_retry: ?WriteRetry = null;
+const retry_interval = 250;
+const retry_attempts = 10;
+fn cancelWriteRetry() void {
+    if (write_retry) |r| {
+        allocator.free(r.name);
+        allocator.free(r.data);
+        write_retry = null;
+    }
+}
+fn scheduleWriteRetry(item: core.Item, from: core.Id, ip: [16]u8, received_at: u64) void {
+    cancelWriteRetry();
+    const name = allocator.dupe(u8, item.name) catch return;
+    const data = allocator.dupe(u8, item.data) catch {
+        allocator.free(name);
+        return;
+    };
+    write_retry = .{ .from = from, .ip = ip, .kind = item.kind, .event = item.event, .name = name, .data = data, .received_at = received_at, .attempts = 0, .next = c.cs_millis() + retry_interval };
+}
+fn delivered(item: core.Item, from: ?usize) void {
+    recordEvent(item.event);
+    remember(item);
+    forward(item, from);
+}
+fn retryWrite(now: u64) void {
+    const r = write_retry orelse return;
+    if (now < r.next) return;
+    const item = core.Item{ .kind = r.kind, .event = r.event, .name = r.name, .data = r.data };
+    const hash = core.fingerprint(item);
+    if (paused or seenEvent(r.event) or (last_hash != null and std.mem.eql(u8, &last_hash.?, &hash))) {
+        cancelWriteRetry();
+        return;
+    }
+    if (writeClip(item)) {
+        c.cs_log_event("clipboard_written", &r.event, null, @ptrCast(&r.ip), item.kind, item.data.len, now - r.received_at);
+        delivered(item, peerIndex(r.from));
+        cancelWriteRetry();
+    } else if (r.attempts + 1 >= retry_attempts) {
+        c.cs_log_event("clipboard_write_abandoned", &r.event, null, @ptrCast(&r.ip), item.kind, item.data.len, now - r.received_at);
+        cancelWriteRetry();
+    } else {
+        write_retry.?.attempts += 1;
+        write_retry.?.next = now + retry_interval;
+    }
+}
 export fn cs_action(action: c_int, index: c_int) void {
     switch (action) {
         1 => { // Restore a history entry and sync it like a new copy.
@@ -199,8 +313,9 @@ export fn cs_action(action: c_int, index: c_int) void {
             if (history.entries[@intCast(index)]) |entry| {
                 const item = core.Item{ .kind = entry.kind, .name = entry.name, .data = entry.data };
                 if (writeClip(item)) {
+                    cancelWriteRetry();
                     last_hash = entry.hash;
-                    if (!paused) propagate(item, null);
+                    if (!paused) propagateLocal(item);
                     history.push(item) catch {};
                     refresh();
                 }
@@ -262,6 +377,7 @@ export fn cs_action(action: c_int, index: c_int) void {
         },
         5 => {
             paused = !paused;
+            if (paused) cancelWriteRetry();
             refresh();
         },
         6 => {
@@ -271,15 +387,11 @@ export fn cs_action(action: c_int, index: c_int) void {
             var j = i;
             while (j + 1 < config.count) : (j += 1) {
                 config.peers[j] = config.peers[j + 1];
-                nonces[j] = nonces[j + 1];
                 peer_compatible[j] = peer_compatible[j + 1];
-                nonce_next[j] = nonce_next[j + 1];
             }
             config.count -= 1;
             config.peers[config.count] = .{};
             peer_compatible[config.count] = false;
-            nonces[config.count] = @splat(@splat(0));
-            nonce_next[config.count] = 0;
             save();
             refresh();
         },
@@ -342,7 +454,8 @@ fn receivePair(packet: []const u8, ip: [16]u8, id: core.Id) void {
     const session: [12]u8 = packet[24..36].*;
     const now = c.cs_millis();
     if (!version.matches(packet[36..52].*)) {
-        hideIncompatible(id);
+        // Unauthenticated: anyone can claim a saved peer's ID, so only hide the nearby entry.
+        hideNearby(id);
         if (pending) |p| {
             if (std.mem.eql(u8, &p.session, &session) and std.mem.eql(u8, slice(&p.ip), slice(&ip))) {
                 pending = null;
@@ -459,30 +572,30 @@ fn receive() void {
     const received_at = c.cs_millis();
     const key = config.peers[i].key;
     const nonce: [12]u8 = packet[24..36].*;
-    for (nonces[i]) |seen| if (std.mem.eql(u8, &seen, &nonce)) return;
     const item = core.decode(packet, key) catch |err| {
         c.cs_log_event("receive_rejected", null, &nonce, @ptrCast(&ip), 0, packet.len, c.cs_millis() - received_at);
         if (err == error.IncompatibleVersion) hideIncompatible(id);
         return;
     };
+    if (!acceptCounter(&config.peers[i], item.counter)) {
+        c.cs_log_event("receive_replayed", null, &nonce, @ptrCast(&ip), 0, packet.len, c.cs_millis() - received_at);
+        return;
+    }
     c.cs_peer_authorized(@ptrCast(&ip));
     if (!peer_compatible[i]) {
         peer_compatible[i] = true;
         refresh();
     }
-    nonces[i][nonce_next[i] % 64] = nonce;
-    nonce_next[i] +%= 1;
-    if (!std.mem.eql(u8, slice(&config.peers[i].ip), slice(&ip))) {
-        config.peers[i].ip = ip;
-        save();
-    }
-    if (std.mem.eql(u8, item.name, "@probe")) {
+    if (!std.mem.eql(u8, slice(&config.peers[i].ip), slice(&ip))) config.peers[i].ip = ip;
+    // Persist the replay window before acting, so a restart cannot accept this frame again.
+    save();
+    if (isControl(item, "@probe")) {
         var reply = config.peers[i];
         reply.ip = ip;
         _ = sendItem(.{ .kind = 1, .name = "@pair", .data = slice(&host) }, reply);
         return;
     }
-    if (std.mem.eql(u8, item.name, "@pair")) return;
+    if (isControl(item, "@pair")) return;
     c.cs_log_event("receive_authenticated", &item.event, &nonce, @ptrCast(&ip), item.kind, item.data.len, c.cs_millis() - received_at);
     if (paused) {
         c.cs_log_event("skipped_paused", &item.event, &nonce, @ptrCast(&ip), item.kind, item.data.len, 0);
@@ -492,20 +605,22 @@ fn receive() void {
         c.cs_log_event("skipped_duplicate", &item.event, &nonce, @ptrCast(&ip), item.kind, item.data.len, 0);
         return;
     }
-    recordEvent(item.event);
     const hash = core.fingerprint(item);
     if (last_hash) |last| {
         if (std.mem.eql(u8, &last, &hash)) {
+            recordEvent(item.event);
             c.cs_log_event("clipboard_already_current", &item.event, &nonce, @ptrCast(&ip), item.kind, item.data.len, c.cs_millis() - received_at);
             return;
         }
     }
+    // The event is recorded only once written, so a retry or relayed copy can still apply it.
     if (writeClip(item)) {
         c.cs_log_event("clipboard_written", &item.event, &nonce, @ptrCast(&ip), item.kind, item.data.len, c.cs_millis() - received_at);
-        remember(item);
-        propagate(item, i);
+        cancelWriteRetry();
+        delivered(item, i);
     } else {
         c.cs_log_event("clipboard_write_failed", &item.event, &nonce, @ptrCast(&ip), item.kind, item.data.len, c.cs_millis() - received_at);
+        scheduleWriteRetry(item, id, ip, received_at);
     }
 }
 fn discoveryPacket() [104]u8 {
@@ -520,12 +635,17 @@ fn discovery() void {
     const buffer = discoveryPacket();
     c.cs_announce(&buffer, buffer.len);
 }
-fn hideIncompatible(id: core.Id) void {
+fn hideNearby(id: core.Id) void {
     for (&nearby) |*device| {
         if (device.*) |d| {
             if (std.mem.eql(u8, &d.id, &id)) device.* = null;
         }
     }
+    refresh();
+}
+// Only for authenticated evidence: the peer itself sent a frame with another app version.
+fn hideIncompatible(id: core.Id) void {
+    hideNearby(id);
     if (peerIndex(id)) |i| {
         peer_compatible[i] = false;
         c.cs_peer_forget(@ptrCast(&config.peers[i].ip));
@@ -538,7 +658,8 @@ fn updateNearby(packet: []const u8, ip: [16]u8) void {
     const id: core.Id = packet[8..24].*;
     if (std.mem.eql(u8, &id, &config.id)) return;
     if (legacy or !version.matches(packet[88..104].*)) {
-        hideIncompatible(id);
+        // Discovery is unauthenticated; never let it demote or disconnect a saved peer.
+        hideNearby(id);
         return;
     }
     var slot: ?usize = null;
@@ -595,14 +716,13 @@ pub fn main() void {
     }
     c.cs_log_init(version.text);
     c.cs_log_event("app_started_v" ++ version.text, null, null, "local", 0, 0, 0);
-    var loaded: Config = .{};
-    const n = c.cs_load(&loaded, @sizeOf(Config));
-    if (n == @sizeOf(Config) and std.mem.eql(u8, &loaded.magic, "CLIPCF01") and loaded.count <= 16) {
-        config = loaded;
-        for (&config.peers) |*peer| {
-            peer.ip[15] = 0;
-            peer.name[63] = 0;
-        }
+    var raw: [@sizeOf(Config)]u8 = undefined;
+    const n = c.cs_load(&raw, raw.len);
+    if (n > 0 and loadConfig(raw[0..@intCast(n)]) != null) {
+        config = loadConfig(raw[0..@intCast(n)]).?;
+        send_next = @max(1, config.send_reserved);
+        // Rewrite a migrated legacy file in the current format immediately.
+        if (n != @sizeOf(Config)) save();
     } else {
         if (!random(&config.id)) return;
         save();
@@ -651,6 +771,7 @@ export fn cs_tick() void {
         c.cs_pairing_hide();
     }
     for (0..8) |_| receive();
+    retryWrite(now);
     if (pending) |p| {
         if (c.cs_pair_status() == 0) {
             pending = null;
@@ -686,8 +807,8 @@ fn resetTest() void {
     pairing_code = null;
     pairing_attempts = 0;
     pending = null;
-    nonces = @splat(@splat(@splat(0)));
-    nonce_next = @splat(0);
+    cancelWriteRetry();
+    send_next = 1;
     recent_events = @splat(@splat(0));
     recent_next = 0;
     c.cs_hostname(&host, host.len);
@@ -698,7 +819,9 @@ fn resetTest() void {
     cs_test_reset();
 }
 fn queueTest(id: core.Id, key: core.Key, nonce: u8, item: core.Item) !void {
-    const packet = try core.encode(&send_buffer, id, @splat(nonce), key, item);
+    var framed = item;
+    if (framed.counter == 0) framed.counter = nonce;
+    const packet = try core.encode(&send_buffer, id, @splat(nonce), key, framed);
     cs_test_queue(packet.ptr, packet.len, "192.168.1.20");
 }
 fn queuePairTest(kind: u8, id: core.Id, session: [12]u8, body: []const u8) void {
@@ -978,8 +1101,8 @@ test "saved peers need authenticated matching versions before appearing or synci
     // Startup retains trust keys but has not verified the running peer's app version.
     peer_compatible[0] = false;
     refresh();
-    try std.testing.expectEqualStrings("", std.mem.span(cs_peer_label(0)));
-    propagate(.{ .kind = 1, .name = "", .data = "Do not send yet" }, null);
+    try std.testing.expectEqualStrings("Saved Windows (192.168.1.20) · offline — Forget", std.mem.span(cs_peer_label(0)));
+    propagateLocal(.{ .kind = 1, .name = "", .data = "Do not send yet" });
     try std.testing.expectEqual(@as(c_int, 0), cs_test_sends());
     var announcement = discoveryPacket();
     @memcpy(announcement[8..24], &id);
@@ -989,7 +1112,7 @@ test "saved peers need authenticated matching versions before appearing or synci
     try queueTest(id, key, 1, .{ .kind = 1, .name = "@pair", .data = "Saved Windows" });
     receive();
     try std.testing.expect(peer_compatible[0]);
-    try std.testing.expect(std.mem.span(cs_peer_label(0)).len > 0);
+    try std.testing.expectEqualStrings("Saved Windows (192.168.1.20) — Forget", std.mem.span(cs_peer_label(0)));
     var other = version.wire;
     other[0] = '9';
     const bad = try core.encode(&send_buffer, id, @splat(2), key, .{ .kind = 1, .name = "", .data = "Wrong version", .app_version = other });
@@ -997,9 +1120,9 @@ test "saved peers need authenticated matching versions before appearing or synci
     receive();
     try std.testing.expect(!peer_compatible[0]);
     try std.testing.expectEqual(@as(c_int, 0), cs_test_writes());
-    try std.testing.expectEqualStrings("", std.mem.span(cs_peer_label(0)));
+    try std.testing.expectEqualStrings("Saved Windows (192.168.1.20) · offline — Forget", std.mem.span(cs_peer_label(0)));
     const sent = cs_test_sends();
-    propagate(.{ .kind = 1, .name = "", .data = "Still blocked" }, null);
+    propagateLocal(.{ .kind = 1, .name = "", .data = "Still blocked" });
     try std.testing.expectEqual(sent, cs_test_sends());
 }
 
@@ -1143,4 +1266,185 @@ test "discovery preserves a healthy peer endpoint and control probes do not clut
     updateNearby(&announcement, alternate_ip);
     try std.testing.expectEqual(@as(c_int, 1), cs_test_sends());
     try std.testing.expectEqual(@as(c_int, 0), cs_test_log_count());
+}
+
+extern fn cs_test_fail_writes(count: c_int) void;
+test "replayed frames stay rejected after a restart and cannot redirect a peer" {
+    resetTest();
+    defer history.deinit();
+    const id: core.Id = @splat(2);
+    const key: core.Key = @splat(9);
+    var home: [16]u8 = @splat(0);
+    set(&home, "192.168.1.20");
+    _ = addPeer(id, key, home, "Windows");
+    var captured: [256]u8 = undefined;
+    const original = try core.encode(&captured, id, @splat(1), key, .{ .kind = 1, .name = "", .data = "old secret", .event = @splat(4), .counter = 100 });
+    const captured_len = original.len;
+    var replay: [256]u8 = undefined;
+    @memcpy(replay[0..captured_len], captured[0..captured_len]);
+    cs_test_queue(&replay, captured_len, "192.168.1.20");
+    receive();
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_writes());
+    // Out-of-order delivery inside the window is accepted once; far older counters are not.
+    try queueTest(id, key, 2, .{ .kind = 1, .name = "", .data = "late", .event = @splat(5), .counter = 40 });
+    receive();
+    try std.testing.expectEqual(@as(c_int, 2), cs_test_writes());
+    try queueTest(id, key, 3, .{ .kind = 1, .name = "", .data = "late again", .event = @splat(6), .counter = 40 });
+    receive();
+    try queueTest(id, key, 4, .{ .kind = 1, .name = "", .data = "too old", .event = @splat(7), .counter = 30 });
+    receive();
+    try std.testing.expectEqual(@as(c_int, 2), cs_test_writes());
+    // Restart: only persisted state survives; event and history caches are empty.
+    const restored = loadConfig(std.mem.asBytes(&config)).?;
+    resetTest();
+    config = restored;
+    @memcpy(replay[0..captured_len], captured[0..captured_len]);
+    cs_test_queue(&replay, captured_len, "10.0.0.66");
+    receive();
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_writes());
+    try std.testing.expectEqualStrings("192.168.1.20", slice(&config.peers[0].ip));
+    try std.testing.expect(!peer_compatible[0]);
+}
+test "outgoing counters are reserved on disk before use and never restart lower" {
+    resetTest();
+    defer history.deinit();
+    const key: core.Key = @splat(9);
+    _ = addPeer(@splat(2), key, @splat(0), "Windows");
+    const saves = cs_test_saves();
+    cs_test_copy("first");
+    cs_poll_clipboard();
+    try std.testing.expectEqual(saves + 1, cs_test_saves());
+    try std.testing.expectEqual(@as(u64, 1 + counter_reservation), config.send_reserved);
+    var packet: [256]u8 = undefined;
+    var item = try core.decode(packet[0..cs_test_sent(&packet)], key);
+    try std.testing.expectEqual(@as(u64, 1), item.counter);
+    cs_test_copy("second");
+    cs_poll_clipboard();
+    try std.testing.expectEqual(saves + 1, cs_test_saves());
+    item = try core.decode(packet[0..cs_test_sent(&packet)], key);
+    try std.testing.expectEqual(@as(u64, 2), item.counter);
+    // After a restart, sending resumes from the persisted reservation.
+    send_next = @max(1, loadConfig(std.mem.asBytes(&config)).?.send_reserved);
+    cs_test_copy("after restart");
+    cs_poll_clipboard();
+    item = try core.decode(packet[0..cs_test_sent(&packet)], key);
+    try std.testing.expectEqual(@as(u64, 1 + counter_reservation), item.counter);
+}
+test "legacy device files migrate with keys intact and an empty replay window" {
+    var legacy = std.mem.zeroes(LegacyConfig);
+    legacy.magic = "CLIPCF01".*;
+    legacy.id = @splat(1);
+    legacy.count = 1;
+    legacy.peers[0].id = @splat(2);
+    legacy.peers[0].key = @splat(9);
+    set(&legacy.peers[0].ip, "192.168.1.20");
+    set(&legacy.peers[0].name, "Windows");
+    const migrated = loadConfig(std.mem.asBytes(&legacy)).?;
+    try std.testing.expectEqualSlices(u8, "CLIPCF02", &migrated.magic);
+    try std.testing.expectEqual(@as(u32, 1), migrated.count);
+    try std.testing.expectEqualSlices(u8, &legacy.peers[0].key, &migrated.peers[0].key);
+    try std.testing.expectEqualStrings("Windows", slice(&migrated.peers[0].name));
+    try std.testing.expectEqual(@as(u64, 0), migrated.peers[0].recv_counter);
+    try std.testing.expect(loadConfig(std.mem.asBytes(&migrated)) != null);
+    try std.testing.expect(loadConfig(std.mem.asBytes(&migrated)[0..100]) == null);
+    legacy.count = 17;
+    try std.testing.expect(loadConfig(std.mem.asBytes(&legacy)) == null);
+}
+test "unauthenticated version claims cannot disconnect a verified peer" {
+    resetTest();
+    defer history.deinit();
+    const id: core.Id = @splat(2);
+    var ip: [16]u8 = @splat(0);
+    set(&ip, "192.168.1.20");
+    _ = addPeer(id, @splat(9), ip, "Windows");
+    try std.testing.expect(peer_compatible[0]);
+    var announcement = discoveryPacket();
+    announcement[8..24].* = id;
+    announcement[88] = '9';
+    updateNearby(&announcement, ip);
+    @memcpy(announcement[0..8], "CLIPDS01");
+    updateNearby(announcement[0..88], ip);
+    var other = version.wire;
+    other[0] = '9';
+    const client = try pairing.State.init(.initiator, "123456".*, @splat(1));
+    queuePairVersionTest(1, id, @splat(7), &pairHelloTest("Spoofed", client.public), other);
+    receive();
+    try std.testing.expect(peer_compatible[0]);
+    try std.testing.expectEqual(@as(u32, 1), config.count);
+}
+test "a failed clipboard write is retried, then forwarded once" {
+    resetTest();
+    defer history.deinit();
+    _ = addPeer(@splat(2), @splat(9), @splat(0), "Windows");
+    _ = addPeer(@splat(3), @splat(8), @splat(0), "Linux");
+    const item = core.Item{ .kind = 1, .name = "", .data = "clipboard was busy", .event = @splat(4) };
+    cs_test_fail_writes(2);
+    try queueTest(@splat(2), @splat(9), 1, item);
+    receive();
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_writes());
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_sends());
+    try std.testing.expect(history.entries[0] == null);
+    cs_test_time(1250);
+    cs_tick();
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_writes());
+    cs_test_time(1500);
+    cs_tick();
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_writes());
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_sends()); // Relayed to Linux only.
+    try std.testing.expectEqualStrings(item.data, history.entries[0].?.data);
+    try std.testing.expect(write_retry == null);
+    try queueTest(@splat(3), @splat(8), 1, item);
+    receive();
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_writes());
+}
+test "a relayed copy or newer local copy resolves a pending write retry" {
+    resetTest();
+    defer history.deinit();
+    _ = addPeer(@splat(2), @splat(9), @splat(0), "Windows");
+    _ = addPeer(@splat(3), @splat(8), @splat(0), "Linux");
+    const item = core.Item{ .kind = 1, .name = "", .data = "via two routes", .event = @splat(4) };
+    cs_test_fail_writes(1);
+    try queueTest(@splat(2), @splat(9), 1, item);
+    receive();
+    // The event was not marked as seen, so the same update relayed by Linux still applies.
+    try queueTest(@splat(3), @splat(8), 1, item);
+    receive();
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_writes());
+    try std.testing.expect(write_retry == null);
+    cs_test_fail_writes(1);
+    try queueTest(@splat(2), @splat(9), 2, .{ .kind = 1, .name = "", .data = "stale remote", .event = @splat(5) });
+    receive();
+    cs_test_copy("newer local copy");
+    cs_poll_clipboard();
+    cs_test_time(2000);
+    cs_tick();
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_writes());
+    try std.testing.expectEqualStrings("newer local copy", history.entries[0].?.data);
+}
+test "offline saved devices remain listed and can be forgotten" {
+    resetTest();
+    defer history.deinit();
+    var ip: [16]u8 = @splat(0);
+    set(&ip, "192.168.1.20");
+    _ = addPeer(@splat(2), @splat(9), ip, "Lost laptop");
+    peer_compatible[0] = false;
+    refresh();
+    try std.testing.expectEqualStrings("Lost laptop (192.168.1.20) · offline — Forget", std.mem.span(cs_peer_label(0)));
+    cs_action(6, 0);
+    try std.testing.expectEqual(@as(u32, 0), config.count);
+    try std.testing.expectEqualStrings("", std.mem.span(cs_peer_label(0)));
+}
+test "files named like control messages sync as ordinary files" {
+    resetTest();
+    defer history.deinit();
+    _ = addPeer(@splat(2), @splat(9), @splat(0), "Windows");
+    try queueTest(@splat(2), @splat(9), 1, .{ .kind = 2, .name = "@probe", .data = "file bytes", .event = @splat(4) });
+    receive();
+    try std.testing.expectEqual(@as(c_int, 1), cs_test_writes());
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_sends()); // No @pair control reply.
+    try std.testing.expectEqualStrings("@probe", history.entries[0].?.name);
+    try history.push(.{ .kind = 2, .name = "@pair", .data = "other bytes" });
+    cs_action(1, 0);
+    const last = cs_test_log_count() - 1;
+    try std.testing.expectEqualStrings("send_queued", std.mem.span(cs_test_log_stage(last)));
 }

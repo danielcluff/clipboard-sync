@@ -6,7 +6,7 @@ static size_t queued_len;
 static char queued_ip[16];
 static unsigned char sent[CS_MAX + 512];
 static size_t sent_len;
-static int writes, sends, saves;
+static int writes, sends, saves, fail_writes;
 static char log_stages[64][40];
 static unsigned char log_events[64][16];
 static int log_count;
@@ -17,7 +17,7 @@ void cs_test_reset(void) {
     free(local_text);
     local_text = NULL;
     queued_len = sent_len = 0;
-    writes = sends = saves = 0;
+    writes = sends = saves = fail_writes = 0;
     log_count = 0;
     pairing_visible = notices = 0;
     now = 1000;
@@ -53,7 +53,13 @@ int cs_send(const char *ip, const void *data, size_t len) {
     sends++;
     return 1;
 }
+/* Simulates another application briefly holding the clipboard. */
+void cs_test_fail_writes(int count) { fail_writes = count; }
 int cs_clip_write(int kind, const unsigned char *data, size_t len, const char *name) {
+    if (fail_writes > 0) {
+        fail_writes--;
+        return 0;
+    }
     writes++;
     return 1;
 }

@@ -2,7 +2,9 @@ const std = @import("std");
 const version = @import("version.zig");
 pub const max_payload = 5 * 1024 * 1024;
 pub const overhead = 56;
-pub const max_packet = max_payload + overhead + 34 + 255;
+/// Encrypted prefix: kind, name length, event ID, app version, replay counter.
+pub const header = 42;
+pub const max_packet = max_payload + overhead + header + 255;
 pub const Key = [32]u8;
 pub const Id = [16]u8;
 const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
@@ -10,6 +12,8 @@ pub const Item = struct {
     kind: u8,
     event: Id = @splat(0),
     app_version: version.Wire = version.wire,
+    /// Strictly increasing per sender; receivers persist a window to reject replays.
+    counter: u64 = 0,
     name: []const u8,
     data: []const u8,
 };
@@ -29,7 +33,7 @@ pub fn encode(out: []u8, sender: Id, nonce: [12]u8, key: Key, item: Item) ![]u8 
     if (item.data.len > max_payload or item.name.len > 255) return error.TooLarge;
     if (item.kind == 2 and !validName(item.name)) return error.InvalidName;
     if (item.kind == 1 and (!std.unicode.utf8ValidateSlice(item.data) or std.mem.indexOfScalar(u8, item.data, 0) != null)) return error.InvalidText;
-    const n = 34 + item.name.len + item.data.len;
+    const n = header + item.name.len + item.data.len;
     if (out.len < overhead + n) return error.TooSmall;
     @memcpy(out[0..8], "CLIPSY02");
     @memcpy(out[8..24], &sender);
@@ -40,25 +44,26 @@ pub fn encode(out: []u8, sender: Id, nonce: [12]u8, key: Key, item: Item) ![]u8 
     plain[1] = @intCast(item.name.len);
     @memcpy(plain[2..18], &item.event);
     @memcpy(plain[18..34], &item.app_version);
-    @memcpy(plain[34 .. 34 + item.name.len], item.name);
-    @memcpy(plain[34 + item.name.len ..], item.data);
+    std.mem.writeInt(u64, plain[34..42], item.counter, .big);
+    @memcpy(plain[header .. header + item.name.len], item.name);
+    @memcpy(plain[header + item.name.len ..], item.data);
     var tag: [16]u8 = undefined;
     Aead.encrypt(plain, &tag, plain, out[0..36], nonce, key);
     @memcpy(out[36..52], &tag);
     return out[0 .. overhead + n];
 }
 pub fn decode(packet: []u8, key: Key) !Item {
-    if (packet.len < overhead + 34 or packet.len > max_packet or !std.mem.eql(u8, packet[0..8], "CLIPSY02")) return error.InvalidPacket;
+    if (packet.len < overhead + header or packet.len > max_packet or !std.mem.eql(u8, packet[0..8], "CLIPSY02")) return error.InvalidPacket;
     const n = std.mem.readInt(u32, packet[52..56], .big);
     if (n != packet.len - overhead) return error.InvalidPacket;
     const plain = packet[overhead..];
     try Aead.decrypt(plain, plain, packet[36..52].*, packet[0..36], packet[24..36].*, key);
-    if (plain.len < 34) return error.InvalidPacket;
+    if (plain.len < header) return error.InvalidPacket;
     if (!version.matches(plain[18..34].*)) return error.IncompatibleVersion;
     if (plain[0] != 1 and plain[0] != 2) return error.InvalidKind;
     const name_len: usize = plain[1];
-    if (name_len + 34 > plain.len or plain.len - name_len - 34 > max_payload) return error.InvalidPacket;
-    const item = Item{ .kind = plain[0], .event = plain[2..18].*, .app_version = plain[18..34].*, .name = plain[34 .. 34 + name_len], .data = plain[34 + name_len ..] };
+    if (name_len + header > plain.len or plain.len - name_len - header > max_payload) return error.InvalidPacket;
+    const item = Item{ .kind = plain[0], .event = plain[2..18].*, .app_version = plain[18..34].*, .counter = std.mem.readInt(u64, plain[34..42], .big), .name = plain[header .. header + name_len], .data = plain[header + name_len ..] };
     if (item.kind == 2 and !validName(item.name)) return error.InvalidName;
     if (item.kind == 1 and (!std.unicode.utf8ValidateSlice(item.data) or std.mem.indexOfScalar(u8, item.data, 0) != null)) return error.InvalidText;
     return item;
@@ -147,10 +152,12 @@ test "file size boundary and event identity survive encryption" {
     defer std.testing.allocator.free(packet);
     var name: [255]u8 = @splat('a');
     @memcpy(name[251..], ".zip");
-    const item = Item{ .kind = 2, .event = @splat(42), .name = &name, .data = data[0..max_payload] };
+    const item = Item{ .kind = 2, .event = @splat(42), .counter = 0x0102030405060708, .name = &name, .data = data[0..max_payload] };
     const encoded = try encode(packet, @splat(1), @splat(2), @splat(3), item);
+    try std.testing.expectEqual(max_packet, encoded.len);
     const decoded = try decode(encoded, @splat(3));
     try std.testing.expectEqualSlices(u8, &item.event, &decoded.event);
+    try std.testing.expectEqual(item.counter, decoded.counter);
     try std.testing.expectEqualSlices(u8, item.data, decoded.data);
     try std.testing.expectError(error.TooLarge, encode(packet, @splat(1), @splat(2), @splat(3), .{ .kind = 2, .name = "too-large.zip", .data = data }));
 }

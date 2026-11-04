@@ -111,12 +111,15 @@ manual IP pairing checks the remote version as well. Pairing confirmation binds
 the version into its authenticated transcript, and clipboard messages carry an
 authenticated version field. Unversioned older builds are rejected.
 
-Previously saved trust keys are retained, but saved devices remain hidden and do
+Previously saved trust keys are retained, but saved devices are marked offline and do
 not receive clipboard content until a versioned, authenticated probe succeeds.
 After updating both computers to the same version, their saved keys work again.
 
 Discovery packets advertise a device name and random device ID without encryption.
 Device names in the nearby list are untrusted; verify the target before pairing.
+Because discovery and pairing hellos are unauthenticated, a version mismatch they
+report only hides the nearby entry; only an authenticated frame from a saved device
+can mark that device incompatible.
 
 Devices communicate on **TCP and UDP port 45832**, over IPv4 on the local network.
 Wi-Fi client isolation, guest networks, VPNs, and firewalls may block communication.
@@ -131,7 +134,8 @@ port, and underlying socket error. This transport fix requires updating both app
 The implementation does not use or interoperate with CrossPaste's wire protocol.
 
 Open the top status/paired-count submenu and select a device's **Forget** entry
-to revoke its access locally; forget it
+to revoke its access locally. Every saved device is listed, including offline or
+not-yet-verified ones (marked "offline"), so a lost device can be revoked; forget it
 on the other computer too if you want to remove both saved records. Up to 16 peers
 can be stored. Groups can relay through paired intermediaries while they are online.
 
@@ -162,7 +166,10 @@ Each line has a UTC timestamp with millisecond precision and a local monotonic
 5. `receive_authenticated`: the receiver accepts/decrypts the clipboard update.
 6. `clipboard_written`: the native clipboard write succeeds; `elapsed_ms` is
    local processing time from handing the frame to the app through the write.
-   A failure instead records `clipboard_write_failed`.
+   A failure instead records `clipboard_write_failed`; the newest failed update is
+   retried every 250 ms for about 2.5 seconds (logging `clipboard_written` or
+   `clipboard_write_abandoned`) unless a newer copy supersedes it. A frame whose
+   replay counter was already accepted records `receive_replayed` and is ignored.
 
 Match `event` IDs across devices and relays. Match `wire` IDs between a
 `send_queued`, `sent`, `received`, and authenticated receipt for an individual
@@ -197,7 +204,7 @@ also clears its in-memory history on the next logged event, so old lines are not
 restored. The first launch of a different
 version clears the log and removes any legacy `sync.log.1` backup; a `log-version`
 marker tracks that transition. Clearing on upgrade is a temporary debugging choice
-that intentionally gives up history from the previous release. Version 0.2.6 must
+that intentionally gives up history from the previous release. Version 0.2.7 must
 be installed on both devices because connections require matching versions.
 
 ## Data and current limits
@@ -219,6 +226,9 @@ be installed on both devices because connections require matching versions.
   multiple-file copies, or files above the size limit. Unsupported items are ignored.
 - Transfers use persistent, authenticated, bidirectional TCP connections. Network
   polling is non-blocking, with bounded work per poll and a 32 MiB aggregate queue.
+  Inbound connections that have not yet delivered an authenticated frame share at
+  most two maximum-size frames of that queue and 16 connection slots, and are closed
+  after 15 seconds plus time proportional to the frame they claim.
   Unsent frames may retry for up to 30 seconds; there is no durable offline queue or
   catch-up merge. Simultaneous copies can race; no distributed ordering is promised.
 - Mac and Windows timers keep syncing during menu tracking. Menus retain stable
@@ -229,8 +239,14 @@ be installed on both devices because connections require matching versions.
   endpoint saved its key. If a previous attempt completed on only one computer,
   generate a new code there and pair again from the other computer; the fresh PIN
   exchange can repair the existing record without clearing all devices.
-- Replay/event caches are bounded and in memory, and reset at restart. This initial
-  custom protocol has not had a security audit and does not provide forward secrecy.
+- Every clipboard frame carries an encrypted, strictly increasing counter. Each device
+  saves, per peer, the highest counter accepted and a 64-frame reordering window in
+  `devices.bin` before acting on a frame, so replays are rejected even after a restart.
+  Outgoing counters are reserved on disk in blocks. Version 0.2.7 migrates older
+  `devices.bin` files automatically. Older versions cannot read the new format, so
+  downgrading starts with no paired devices.
+  This initial custom protocol has not had a security audit and does not provide
+  forward secrecy.
 - macOS builds include an `.app` bundle. No installers, signing/notarization,
   startup registration, or auto-updates yet.
 

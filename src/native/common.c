@@ -433,23 +433,31 @@ void cs_hostname(char *out, size_t cap) {
    a poll has bounded I/O work and never waits for another computer. */
 #define CHANNEL_COUNT 32
 #define NETWORK_LIMIT (32 * 1024 * 1024)
-#define FRAME_LIMIT (CS_MAX + 345)
+/* 56-byte cleartext header, 42-byte encrypted prefix, file name, and payload. */
+#define FRAME_LIMIT (CS_MAX + 56 + 42 + 255)
 #define IO_QUANTUM (256 * 1024)
+/* Connections that have not yet delivered an authenticated frame share a small part of
+   the queue and slot table, and must finish within a deadline, so a LAN client that
+   only sends headers cannot starve authenticated peers. */
+#define UNVERIFIED_LIMIT (2 * (FRAME_LIMIT + sizeof(frame)))
+#define UNVERIFIED_INCOMING 16
+#define UNVERIFIED_GRACE_MS 15000
+#define UNVERIFIED_BYTES_PER_MS 128
 typedef struct frame {
     struct frame *next;
     size_t size, offset;
     uint64_t created;
-    int channel, quiet;
+    int channel, quiet, unverified;
     unsigned generation;
     char ip[16];
     unsigned char bytes[];
 } frame;
 typedef struct {
-    int used, connecting, authenticated, closing;
+    int used, connecting, authenticated, closing, incoming;
     sock socket;
     char ip[16];
     unsigned generation;
-    uint64_t progress, retry_at;
+    uint64_t progress, retry_at, opened;
     unsigned char header[56];
     size_t header_read;
     frame *input, *out_head, *out_tail;
@@ -478,7 +486,7 @@ int cs_test_age_idle_peer(const char *ip, uint64_t age_ms) {
 }
 #endif
 static frame *incoming_head, *incoming_tail;
-static size_t network_bytes;
+static size_t network_bytes, unverified_bytes;
 static int pairing_channel = -1, delivered_channel = -1;
 static unsigned delivered_generation;
 static unsigned next_generation = 1;
@@ -553,8 +561,46 @@ static void release_frame(frame *f) {
     if (!f)
         return;
     network_bytes -= sizeof(frame) + f->size;
+    if (f->unverified)
+        unverified_bytes -= sizeof(frame) + f->size;
     free(f);
 }
+static frame *allocate_input(const channel *c, size_t size) {
+    if (c->authenticated)
+        return allocate_frame(size);
+    if (unverified_bytes + sizeof(frame) + size > UNVERIFIED_LIMIT) {
+        snprintf(net_error, sizeof(net_error), "Too much unauthenticated network data.");
+        return NULL;
+    }
+    frame *f = allocate_frame(size);
+    if (f) {
+        f->unverified = 1;
+        unverified_bytes += sizeof(frame) + size;
+    }
+    return f;
+}
+static int unverified_incoming(void) {
+    int count = 0;
+    for (int i = 0; i < CHANNEL_COUNT; i++)
+        if (channels[i].used && channels[i].incoming && !channels[i].authenticated)
+            count++;
+    return count;
+}
+/* Time allowed before an unauthenticated inbound connection must authenticate. Large
+   first frames get extra time proportional to their size for slow links. */
+static uint64_t unverified_deadline(const channel *c) {
+    return UNVERIFIED_GRACE_MS + (c->input ? c->input->size / UNVERIFIED_BYTES_PER_MS : 0);
+}
+#ifdef CS_TESTING
+size_t cs_test_unverified_bytes(void) { return unverified_bytes; }
+size_t cs_test_unverified_limit(void) { return UNVERIFIED_LIMIT; }
+int cs_test_unverified_channels(void) { return unverified_incoming(); }
+void cs_test_age_unverified(uint64_t age_ms) {
+    for (int i = 0; i < CHANNEL_COUNT; i++)
+        if (channels[i].used && channels[i].incoming && !channels[i].authenticated)
+            channels[i].opened = cs_millis() - age_ms;
+}
+#endif
 static void close_channel(int i, int retry) {
     channel *c = &channels[i];
     if (!c->used)
@@ -600,7 +646,7 @@ static int new_channel(const char *ip, sock s) {
             c->used = 1;
             c->socket = s;
             c->generation = next_generation++;
-            c->progress = cs_millis();
+            c->progress = c->opened = cs_millis();
             snprintf(c->ip, sizeof(c->ip), "%s", ip);
             return i;
         }
@@ -631,6 +677,7 @@ static int connect_channel(int i) {
         return 0;
     }
     c->socket = s;
+    c->incoming = 0;
     c->connecting = result != 0;
     c->progress = cs_millis();
     c->retry_at = 0;
@@ -693,7 +740,7 @@ static void adopt_queue(int target) {
 static int valid_length(const unsigned char *header, size_t *size) {
     uint32_t len = ((uint32_t)header[52] << 24) | ((uint32_t)header[53] << 16) |
                    ((uint32_t)header[54] << 8) | header[55];
-    int clip = !memcmp(header, "CLIPSY02", 8) && len >= 34 && len <= FRAME_LIMIT - 56;
+    int clip = !memcmp(header, "CLIPSY02", 8) && len >= 42 && len <= FRAME_LIMIT - 56;
     int pair = !memcmp(header, "CLIPPR03", 8) && len >= 1 && len <= 130;
     *size = (size_t)len + 56;
     return clip || pair;
@@ -764,7 +811,7 @@ static void read_channel(int i) {
             c->header_read += (size_t)n;
             if (c->header_read == 56) {
                 size_t size;
-                if (!valid_length(c->header, &size) || !(c->input = allocate_frame(size))) {
+                if (!valid_length(c->header, &size) || !(c->input = allocate_input(c, size))) {
                     close_channel(i, 0);
                     return;
                 }
@@ -817,11 +864,18 @@ static void network_poll(void) {
             continue;
         }
         configure_socket(s);
+        if (unverified_incoming() >= UNVERIFIED_INCOMING) {
+            snprintf(net_error, sizeof(net_error), "Too many unauthenticated connections.");
+            close_socket(s);
+            continue;
+        }
         char ip[16];
         inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
         int i = new_channel(ip, s);
         if (i < 0)
             close_socket(s);
+        else
+            channels[i].incoming = 1;
     }
     uint64_t now = cs_millis();
     for (int i = 0; i < CHANNEL_COUNT; i++) {
@@ -860,6 +914,12 @@ static void network_poll(void) {
             }
             c->connecting = 0;
             c->progress = now;
+        }
+        if (c->incoming && !c->authenticated && now - c->opened > unverified_deadline(c)) {
+            snprintf(net_error, sizeof(net_error),
+                     "An unauthenticated connection did not finish in time.");
+            close_channel(i, 0);
+            continue;
         }
         if ((c->out_head || c->header_read || c->input || !c->authenticated) &&
             now - c->progress > 10000) {

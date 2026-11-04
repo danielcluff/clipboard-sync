@@ -1,7 +1,7 @@
 const std = @import("std");
 // Bump for every app release; all devices must run this exact version.
-pub const text = "0.2.6";
-pub const build_number = "8";
+pub const text = "0.2.7";
+pub const build_number = "9";
 pub const Wire = [16]u8;
 pub const wire: Wire = value: {
     if (text.len >= 16) @compileError("App version must fit in 15 bytes plus a terminator");
