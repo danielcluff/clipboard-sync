@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#000000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <title>Clipboard Sync</title>
+  <desc>A tilted clipboard moving quickly to the right, with three trailing speed lines.</desc>
+  <path d="M 1.75 7 H 6.25 M 2.75 12 H 5.5 M 1.75 17 H 4.75"/>
+  <g transform="rotate(10 15.5 12)">
+    <path d="M 12.5 5 H 12 C 10.895 5 10 5.895 10 7 V 18.5 C 10 19.605 10.895 20.5 12 20.5 H 19 C 20.105 20.5 21 19.605 21 18.5 V 7 C 21 5.895 20.105 5 19 5 H 17.5"/>
+    <path d="M 13.5 3 H 16.5 C 17.052 3 17.5 3.448 17.5 4 V 6 H 12.5 V 4 C 12.5 3.448 12.948 3 13.5 3 Z"/>
+  </g>
+</svg>

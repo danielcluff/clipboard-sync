@@ -2,6 +2,7 @@
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
 #include "bridge.h"
+#include "tray_resources.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -17,6 +18,44 @@ static HMENU menu;
 static int menuDirty = 1, menuTracking;
 static unsigned char historyIds[10][32];
 static void rebuild_menu(void);
+static int trayVariant = -1, trayWidth, trayHeight;
+static int tray_icon_variant(void) {
+    HIGHCONTRASTW contrast = {0};
+    contrast.cbSize = sizeof(contrast);
+    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON)) {
+        COLORREF ink = GetSysColor(COLOR_WINDOWTEXT);
+        return GetRValue(ink) + GetGValue(ink) + GetBValue(ink) > 3 * 127 ? CS_ICON_DARK_TASKBAR
+                                                                          : CS_ICON_LIGHT_TASKBAR;
+    }
+    DWORD light = 0, bytes = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"SystemUsesLightTheme", RRF_RT_REG_DWORD, NULL, &light, &bytes);
+    return light ? CS_ICON_LIGHT_TASKBAR : CS_ICON_DARK_TASKBAR;
+}
+static int update_tray_icon(void) {
+    if (!tray.hWnd)
+        return 0;
+    int variant = tray_icon_variant();
+    int width = GetSystemMetrics(SM_CXSMICON), height = GetSystemMetrics(SM_CYSMICON);
+    if (tray.hIcon && variant == trayVariant && width == trayWidth && height == trayHeight)
+        return 1;
+    HICON image = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(variant), IMAGE_ICON,
+                                    width, height, 0);
+    if (!image)
+        return 0;
+    HICON previous = tray.hIcon;
+    tray.hIcon = image;
+    trayVariant = variant;
+    trayWidth = width;
+    trayHeight = height;
+    if (previous) {
+        Shell_NotifyIconW(NIM_MODIFY, &tray);
+        DestroyIcon(previous);
+    }
+    return 1;
+}
 static WCHAR *wide(const char *s) {
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
     if (!n)
@@ -41,6 +80,11 @@ static HMENU compact_popup(void) {
     return popup;
 }
 static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_SETTINGCHANGE || msg == WM_THEMECHANGED || msg == WM_SYSCOLORCHANGE ||
+        msg == WM_DPICHANGED) {
+        update_tray_icon();
+        return 0;
+    }
     if (msg == WM_CLIPBOARDUPDATE) {
         if (GetClipboardSequenceNumber() != lastSequence) {
             cs_log_event("clipboard_change_notified", NULL, NULL, "local", 0, 0, 0);
@@ -56,6 +100,9 @@ static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         cs_tick();
         if (menuDirty)
             rebuild_menu();
+        int startup = cs_startup_status();
+        CheckMenuItem(menu, 800, MF_BYCOMMAND | (startup == 1 ? MF_CHECKED : MF_UNCHECKED));
+        EnableMenuItem(menu, 800, MF_BYCOMMAND | (startup < 0 ? MF_GRAYED : MF_ENABLED));
         POINT p;
         GetCursorPos(&p);
         SetForegroundWindow(h);
@@ -91,7 +138,8 @@ int cs_init(void) {
     tray.uID = 1;
     tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray.uCallbackMessage = WM_APP + 1;
-    tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    if (!update_tray_icon())
+        return 0;
     wcscpy(tray.szTip, L"Clipboard Sync");
     lastSequence = GetClipboardSequenceNumber() - 1;
     clipboardListener = AddClipboardFormatListener(window);
@@ -152,6 +200,7 @@ static void rebuild_menu(void) {
     }
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)devices, L"Connect");
     add(menu, cs_sync_action_label(), 5, 0);
+    add(menu, "Launch at login", 8, 0);
     add(menu, "Quit Clipboard Sync", 7, 0);
 }
 static LRESULT CALLBACK pairing_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -390,6 +439,10 @@ void cs_shutdown(void) {
     KillTimer(window, 1);
     cs_pairing_hide();
     DestroyWindow(window);
+    if (tray.hIcon) {
+        DestroyIcon(tray.hIcon);
+        tray.hIcon = NULL;
+    }
     if (menu)
         DestroyMenu(menu);
 }

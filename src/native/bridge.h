@@ -14,6 +14,10 @@ int cs_init(void);
 void cs_pump(void);
 void cs_shutdown(void);
 void cs_refresh(void);
+/* Startup status: -1=unavailable, 0=off, 1=on, 2=needs macOS user approval. */
+int cs_startup_status(void);
+int cs_startup_set_enabled(int enabled);
+void cs_startup_toggle(void);
 void cs_notice(const char *title, const char *text);
 void cs_pairing_show(const char *code);
 void cs_pairing_hide(void);

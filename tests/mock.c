@@ -11,6 +11,7 @@ static char log_stages[64][40];
 static unsigned char log_events[64][16];
 static int log_count;
 static int pairing_visible, notices;
+static int startup_enabled;
 static char *local_text;
 static uint64_t now = 1000;
 void cs_test_reset(void) {
@@ -21,6 +22,7 @@ void cs_test_reset(void) {
     log_count = 0;
     pairing_visible = notices = 0;
     now = 1000;
+    startup_enabled = 0;
 }
 void cs_test_queue(const void *data, size_t len, const char *ip) {
     memcpy(queued, data, len);
@@ -148,3 +150,6 @@ const unsigned char *cs_test_log_event(int i) { return log_events[i]; }
 void cs_log_init(const char *version) {}
 
 int cs_send_control(const char *ip, const void *data, size_t len) { return cs_send(ip, data, len); }
+
+int cs_startup_status(void) { return startup_enabled; }
+void cs_startup_toggle(void) { startup_enabled = !startup_enabled; }

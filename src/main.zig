@@ -405,6 +405,10 @@ export fn cs_action(action: c_int, index: c_int) void {
             refresh();
         },
         7 => running = false,
+        8 => {
+            c.cs_startup_toggle();
+            refresh();
+        },
         else => {},
     }
 }
@@ -1522,4 +1526,18 @@ test "a replayed old-version frame cannot demote a peer that answers its probe" 
     cs_tick();
     try std.testing.expect(peer_compatible[0]);
     try std.testing.expectEqual(@as(u32, 1), config.count);
+}
+
+test "launch at login is an independent native setting and does not sync or save peer state" {
+    resetTest();
+    defer history.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), c.cs_startup_status());
+    cs_action(8, 0);
+    try std.testing.expectEqual(@as(c_int, 1), c.cs_startup_status());
+    cs_action(8, 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.cs_startup_status());
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_sends());
+    try std.testing.expectEqual(@as(c_int, 0), cs_test_saves());
+    try std.testing.expect(!paused);
+    try std.testing.expect(running);
 }

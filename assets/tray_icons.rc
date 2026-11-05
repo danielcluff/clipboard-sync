@@ -1,0 +1,4 @@
+#include "tray_resources.h"
+CS_ICON_APPLICATION ICON "tray-black.ico"
+CS_ICON_LIGHT_TASKBAR ICON "tray-black.ico"
+CS_ICON_DARK_TASKBAR ICON "tray-white.ico"

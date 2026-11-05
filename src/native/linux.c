@@ -249,3 +249,8 @@ void cs_shutdown(void) {
         gtk_widget_destroy(menu);
     gtk_clipboard_clear(clipboard);
 }
+
+/* Startup integration is currently offered by the macOS and Windows adapters. */
+int cs_startup_status(void) { return -1; }
+int cs_startup_set_enabled(int enabled) { return 0; }
+void cs_startup_toggle(void) {}

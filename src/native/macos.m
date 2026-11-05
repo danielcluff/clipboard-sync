@@ -1,4 +1,5 @@
 #include "bridge.h"
+#include "tray_icon_pdf.h"
 #import <AppKit/AppKit.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,18 @@ static NSInteger lastChange = -1;
 static BOOL menuDirty = YES;
 static NSTimer *syncTimer;
 static void populateMenu(NSMenu *menu);
+static void updateStartupItem(NSMenu *menu) {
+    NSMenuItem *item = [menu itemWithTag:800];
+    int status = cs_startup_status();
+    item.title = status == 2 ? @"Launch at login (approve in Settings…)" : @"Launch at login";
+    item.state = status == 1   ? NSControlStateValueOn
+                 : status == 2 ? NSControlStateValueMixed
+                               : NSControlStateValueOff;
+    item.action = status < 0 ? nil : @selector(action:);
+    item.enabled = status >= 0;
+    item.toolTip =
+        status < 0 ? @"Requires macOS 13 or later and the Clipboard Sync.app bundle." : nil;
+}
 @interface CSDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @end
 @implementation CSDelegate
@@ -30,6 +43,7 @@ static void populateMenu(NSMenu *menu);
             populateMenu(menu);
             menuDirty = NO;
         }
+        updateStartupItem(menu);
     }
 }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -67,7 +81,14 @@ int cs_init(void) {
     NSApp.delegate = delegate;
     [NSApp finishLaunching];
     statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    statusItem.button.title = @"⇄";
+    NSImage *trayImage = [[NSImage alloc]
+        initWithData:[NSData dataWithBytes:cs_tray_icon_pdf length:sizeof(cs_tray_icon_pdf)]];
+    trayImage.size = NSMakeSize(18, 18);
+    trayImage.template = YES;
+    statusItem.button.title = @"";
+    statusItem.button.image = trayImage;
+    statusItem.button.imagePosition = NSImageOnly;
+    statusItem.button.accessibilityLabel = @"Clipboard Sync";
     statusItem.button.toolTip = @"Clipboard Sync";
     NSMenu *menu = [NSMenu new];
     menu.delegate = delegate;
@@ -133,6 +154,7 @@ static void populateMenu(NSMenu *menu) {
     NSMenuItem *sync = menu.itemArray.lastObject;
     NSString *symbol = cs_is_paused() ? @"play.fill" : @"pause.fill";
     sync.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:sync.title];
+    add(menu, "Launch at login", 8, 0);
     add(menu, "Quit Clipboard Sync", 7, 0);
 }
 void cs_refresh(void) {

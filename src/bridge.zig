@@ -11,6 +11,8 @@ pub extern fn cs_init() c_int;
 pub extern fn cs_pump() void;
 pub extern fn cs_shutdown() void;
 pub extern fn cs_refresh() void;
+pub extern fn cs_startup_status() c_int;
+pub extern fn cs_startup_toggle() void;
 pub extern fn cs_notice(title: [*:0]const u8, text: [*:0]const u8) void;
 pub extern fn cs_prompt(title: [*:0]const u8, text: [*:0]const u8, out: [*c]u8, cap: usize) c_int;
 pub extern fn cs_clip_read(out: *cs_clip) c_int;

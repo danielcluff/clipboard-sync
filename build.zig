@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     mod.addIncludePath(b.path("src/native"));
+    mod.addIncludePath(b.path("assets"));
     mod.addCSourceFile(.{ .file = b.path("src/native/common.c"), .flags = &.{"-std=c11"} });
     switch (target.result.os.tag) {
         .macos => {
@@ -16,10 +17,14 @@ pub fn build(b: *std.Build) void {
             mod.addCSourceFile(.{ .file = b.path("src/native/macos.m"), .flags = &.{"-fobjc-arc"} });
             mod.linkFramework("AppKit", .{});
             mod.linkFramework("Foundation", .{});
+            mod.linkFramework("ServiceManagement", .{});
+            mod.addCSourceFile(.{ .file = b.path("src/native/startup_macos.m"), .flags = &.{"-fobjc-arc"} });
         },
         .windows => {
             mod.addCSourceFile(.{ .file = b.path("src/native/windows.c"), .flags = &.{} });
-            for ([_][]const u8{ "user32", "shell32", "ws2_32", "ole32", "gdi32" }) |lib| mod.linkSystemLibrary(lib, .{});
+            mod.addCSourceFile(.{ .file = b.path("src/native/startup_windows.c"), .flags = &.{} });
+            mod.addWin32ResourceFile(.{ .file = b.path("assets/tray_icons.rc"), .include_paths = &.{ b.path("assets"), b.path("src/native") } });
+            for ([_][]const u8{ "user32", "shell32", "ws2_32", "ole32", "gdi32", "advapi32" }) |lib| mod.linkSystemLibrary(lib, .{});
         },
         .linux => {
             mod.addCSourceFile(.{ .file = b.path("src/native/linux.c"), .flags = &.{"-Wno-deprecated-declarations"} });
@@ -36,8 +41,16 @@ pub fn build(b: *std.Build) void {
         const info_version = std.mem.replaceOwned(u8, b.graph.arena, @embedFile("packaging/macos/Info.plist"), "@APP_VERSION@", version.text) catch @panic("OOM");
         const info = std.mem.replaceOwned(u8, b.graph.arena, info_version, "@APP_BUILD@", version.build_number) catch @panic("OOM");
         const app_info = b.addInstallFile(b.addWriteFiles().add("Info.plist", info), app_dir ++ "/Contents/Info.plist");
-        b.getInstallStep().dependOn(&app_binary.step);
-        b.getInstallStep().dependOn(&app_info.step);
+        const app_icon = b.addInstallFile(b.path("assets/AppIcon.icns"), app_dir ++ "/Contents/Resources/AppIcon.icns");
+        // Bind Info.plist and the bundle identifier into a local signature for SMAppService.
+        // A Developer ID identity can replace the default ad-hoc identity for distribution.
+        const identity = b.option([]const u8, "macos-sign-identity", "macOS codesign identity (default: local ad-hoc signing)") orelse "-";
+        const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", identity });
+        sign.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = app_dir } });
+        sign.step.dependOn(&app_binary.step);
+        sign.step.dependOn(&app_info.step);
+        sign.step.dependOn(&app_icon.step);
+        b.getInstallStep().dependOn(&sign.step);
         // LaunchServices owns the app process, so closing the launching shell cannot quit it.
         const run = b.addSystemCommand(&.{"open"});
         run.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = app_dir } });
@@ -56,6 +69,16 @@ pub fn build(b: *std.Build) void {
     integration_mod.addCSourceFile(.{ .file = b.path("tests/mock.c"), .flags = &.{} });
     const integration = b.addTest(.{ .root_module = integration_mod });
     test_step.dependOn(&b.addRunArtifact(integration).step);
+    if (target.result.os.tag == .windows) {
+        const startup_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        startup_mod.addIncludePath(b.path("src/native"));
+        // A test-only key keeps the real login configuration untouched.
+        startup_mod.addCMacro("CS_STARTUP_KEY", "L\"Software\\\\ClipboardSync\\\\StartupTest\"");
+        startup_mod.addCSourceFiles(.{ .files = &.{ "src/native/startup_windows.c", "tests/startup_windows.c" }, .flags = &.{} });
+        startup_mod.linkSystemLibrary("advapi32", .{});
+        const startup_test = b.addExecutable(.{ .name = "startup-test", .root_module = startup_mod });
+        test_step.dependOn(&b.addRunArtifact(startup_test).step);
+    }
     const log_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
     log_mod.addIncludePath(b.path("src/native"));
     log_mod.addCSourceFiles(.{ .files = &.{ "src/native/common.c", "tests/log.c" }, .flags = &.{} });

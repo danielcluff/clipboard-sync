@@ -1,6 +1,6 @@
 # Clipboard Sync
 
-Clipboard Sync **0.2.1** is a small LAN clipboard-sync tray application with a **Zig 0.17** engine and native
+Clipboard Sync **0.2.9** is a small LAN clipboard-sync tray application with a **Zig 0.17** engine and native
 clipboard/menu adapters for macOS, Windows, and Linux X11. Copy on one paired
 computer; the app automatically updates the clipboard on the others. No extra
 “send” action, server, account, or cloud service.
@@ -20,6 +20,7 @@ checks below. Native Wayland support is not implemented.
 - Nearby discovery using IPv4 UDP broadcasts, with manual IPv4 entry as a fallback.
 - Exact app-version checks: incompatible and unversioned devices stay hidden and cannot pair or sync.
 - Explicit pairing, persistent trusted devices, forgetting devices, and pause/resume.
+- Optional launch at login on macOS and Windows, controlled from the tray menu.
 - ChaCha20-Poly1305 authenticated encryption with a separate derived secret per pair.
 - Six-digit, single-use pairing codes with a two-minute expiry and a five-attempt limit.
 - Event IDs stop relayed copies circulating around groups of paired devices.
@@ -37,8 +38,8 @@ zig build run
 
 On macOS, launch `zig-out/Clipboard Sync.app`. On Windows, launch
 `zig-out/bin/clipboard-sync.exe`; Linux uses `zig-out/bin/clipboard-sync`.
-Run it on each computer. macOS shows **⇄** in the menu bar; Windows shows a system
-tray icon. Open the top **Sync active / paired count** submenu to see paired devices
+Run it on each computer. macOS and Windows show a clipboard with motion lines in
+the menu bar or system tray. Open the top **Sync active / paired count** submenu to see paired devices
 and forget a device. **Connect** contains nearby discovery and pairing actions only.
 Quit and pause/resume are available in the main menu.
 
@@ -57,6 +58,30 @@ Applications. It launches directly into the menu bar without a Terminal window o
 Dock icon, and keeps running independently of the launching terminal. `zig build run`
 also launches this bundle through macOS LaunchServices. Use the menu's **Quit
 Clipboard Sync** command to exit. Quit any older terminal-launched instance first.
+
+### Package the Mac download
+
+After building, create a compressed DMG with the app and an Applications shortcut:
+
+```sh
+python3 -m venv /tmp/clipboard-dmg-tools
+/tmp/clipboard-dmg-tools/bin/pip install dmgbuild==1.6.7
+/tmp/clipboard-dmg-tools/bin/python scripts/package_macos.py \
+  "zig-out/Clipboard Sync.app" "zig-out/clipboard-sync-0.2.9-macos-arm64.dmg"
+```
+
+The packaging script uses [dmgbuild](https://dmgbuild.readthedocs.io/en/latest/)
+to position the two icons in Finder with a solid black arrow between them.
+The checked-in backgrounds include 1x and 2x artwork; regenerate them with
+`python3 scripts/generate_dmg_background.py`. It verifies the
+app signature before packaging, the disk image checksum afterward, and the signed
+app and Applications shortcut inside the finished image. Choose a
+new output path if one already exists. This only packages the existing build; it
+does not change its version or add Developer ID signing/notarization. The packaging
+dependency is separate from normal Zig builds.
+
+Open the DMG, drag Clipboard Sync onto Applications, eject the image, and launch
+the installed copy from Applications before enabling **Launch at login**.
 
 ### Windows
 
@@ -87,6 +112,42 @@ Wayland applications are not guaranteed to share this clipboard. A dedicated
 Wayland data-control/portal backend and modern StatusNotifier tray are future work.
 Cross-compiling Linux also requires target GTK libraries and a matching sysroot;
 Zig cannot supply third-party desktop libraries automatically.
+
+## Launch at login
+
+On macOS and Windows, choose **Launch at login** in the main tray menu. A checkmark
+means this app is registered for the current user. The setting is off by default;
+turning it off does not quit the running app. Registration happens only when you
+choose the option, never automatically on launch. Login starts the app directly in
+the tray, without opening a terminal. This runs after sign-in, rather than before
+any user has logged in.
+
+- **macOS 13 or later:** uses Apple's `SMAppService.mainAppService`. Open the `.app`
+  bundle; the standalone executable cannot register itself. Copy the app to
+  `/Applications` or `~/Applications` before enabling the setting. If macOS requires
+  approval, the menu shows **Launch at login (approve in Settings…)** and opens
+  System Settings → General → Login Items. Click that entry again to reopen
+  Settings. Changes made in System Settings are reflected when reopening the menu.
+  Builds now locally ad-hoc sign the bundle so the login-item API has a proper
+  bundle signature; this needs no paid developer account and is not Developer ID
+  signing or notarization. `-Dmacos-sign-identity="<identity>"` overrides the local
+  signing identity. After moving/rebuilding an ad-hoc signed app, verify its login
+  item again; local signing does not provide a stable developer identity.
+- **Windows:** registers the quoted path to the running EXE under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value **Clipboard Sync**.
+  Keep the executable in a permanent folder before enabling this. Turning the
+  option off removes only this app's entry. If you move the app, enable it again
+  from the new location. Windows Startup settings can independently disable its
+  launch; the tray checkmark indicates registration for this executable, not an
+  override of Windows' settings. No administrator access is needed. Windows may
+  delay startup apps after login.
+- **Linux:** startup integration is not offered yet; clipboard and tray behavior
+  are unchanged.
+
+Manual verification: enable the option, quit and reopen the app to check the
+checkmark, sign out/in and confirm one tray instance appears without a terminal,
+then disable it and verify it no longer starts at the next login. On Mac also
+check denial/approval in Login Items. On Windows test from a path containing spaces.
 
 ## Pair two computers
 
@@ -207,7 +268,7 @@ also clears its in-memory history on the next logged event, so old lines are not
 restored. The first launch of a different
 version clears the log and removes any legacy `sync.log.1` backup; a `log-version`
 marker tracks that transition. Clearing on upgrade is a temporary debugging choice
-that intentionally gives up history from the previous release. Version 0.2.7 must
+that intentionally gives up history from the previous release. Version 0.2.9 must
 be installed on both devices because connections require matching versions.
 
 ## Data and current limits
@@ -250,8 +311,8 @@ be installed on both devices because connections require matching versions.
   downgrading starts with no paired devices.
   This initial custom protocol has not had a security audit and does not provide
   forward secrecy.
-- macOS builds include an `.app` bundle. No installers, signing/notarization,
-  startup registration, or auto-updates yet.
+- macOS builds include an `.app` bundle. No installers, Developer ID signing/notarization,
+  or auto-updates yet. Local macOS bundles use ad-hoc signing for launch at login.
 
 ## Implementation and validation
 
@@ -284,3 +345,19 @@ compare its SHA-256, reject a file above 5 MiB, pause/resume, forget a peer, res
 both apps, and reconnect after an IP change. Verify the Linux desktop's tray and
 file-manager paste behavior separately. Automated tests do not replace these native
 OS integration checks.
+
+## Tray icon artwork
+
+`assets/tray-icon.svg` is the canonical vector artwork, based on the original
+clipboard-with-speed-lines sketch. macOS embeds a vector PDF as an 18-point template
+image, so AppKit handles light/dark appearances and Retina scaling. Windows embeds
+transparent black/white ICOs at 16, 20, 24, 32, 40, 48, 64 and 256 pixels, selects a
+variant for the taskbar theme/contrast setting, and reloads it when those settings
+change. The ICO resources also replace the EXE's default application icon.
+
+Generated PDF, header and ICO files are committed; ordinary Zig builds need no
+artwork-generation tools. After editing the SVG, regenerate on macOS with Command
+Line Tools and Python 3 using `python3 scripts/generate_tray_icons.py`. The script
+uses only Python's standard library and AppKit. `assets/AppIcon.icns` packages the same glyph on a neutral tile for the Mac
+application icon in Finder and application listings. `assets/tray-icon-preview.png`
+shows the same artwork on light/dark surfaces, including its small tray sizes.
