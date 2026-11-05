@@ -1,1 +1,4 @@
 *.pdf binary
+
+# zig fmt requires LF line endings, including on Windows checkouts.
+*.zig text eol=lf
